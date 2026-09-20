@@ -165,6 +165,8 @@ pub enum Method {
     PaneResize(PaneResizeParams),
     #[serde(rename = "pane.scroll")]
     PaneScroll(PaneScrollParams),
+    #[serde(rename = "pane.clear")]
+    PaneClear(PaneTarget),
     #[serde(rename = "pane.edit_scrollback")]
     PaneEditScrollback(PaneTarget),
     #[serde(rename = "pane.selection.read")]
@@ -185,6 +187,8 @@ pub enum Method {
     PaneInputSet(PaneInputSetParams),
     #[serde(rename = "pane.link.activate")]
     PaneLinkActivate(PaneLinkActivateParams),
+    #[serde(rename = "pane.link.resolve")]
+    PaneLinkResolve(PaneLinkActivateParams),
     #[serde(rename = "pane.rename")]
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]

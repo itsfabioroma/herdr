@@ -808,6 +808,12 @@
             "pane_id": {
               "type": "string"
             },
+            "restore_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -5710,6 +5716,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.clear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.edit_scrollback",
               "type": "string"
             },
@@ -5855,6 +5877,22 @@
           "properties": {
             "method": {
               "const": "pane.link.activate",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneLinkActivateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.link.resolve",
               "type": "string"
             },
             "params": {
@@ -7973,6 +8011,12 @@
             "pane_id": {
               "type": "string"
             },
+            "restore_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -8159,6 +8203,35 @@
             "direction",
             "ratio",
             "rect"
+          ],
+          "type": "object"
+        },
+        "PaneLinkRegion": {
+          "description": "Inclusive display-cell columns on a pane's current viewport.",
+          "properties": {
+            "end_col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "row": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "row",
+            "start_col",
+            "end_col"
           ],
           "type": "object"
         },
@@ -10371,6 +10444,25 @@
                 "action",
                 "context",
                 "log"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "regions": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/PaneLinkRegion"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "pane_link_resolved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "regions"
               ],
               "type": "object"
             },

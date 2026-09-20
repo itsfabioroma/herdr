@@ -21,7 +21,9 @@ mod migration_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
 
-use super::cursor::{CursorPositionSettleState, DecscusrTracker, CURSOR_POSITION_SETTLE};
+#[cfg(test)]
+use super::cursor::CURSOR_POSITION_SETTLE;
+use super::cursor::{CursorPositionSettleState, DecscusrTracker};
 use super::{
     input::{
         ghostty_key_event_from_terminal_key, ghostty_mouse_encoder_for_terminal,
@@ -256,6 +258,10 @@ impl PaneTerminal {
 
     pub fn scroll_reset(&self) {
         self.ghostty.scroll_reset();
+    }
+
+    pub fn clear_screen(&self) -> Result<(), String> {
+        self.ghostty.clear_screen()
     }
 
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
@@ -540,6 +546,19 @@ impl PaneTerminal {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.ghostty.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.ghostty.link_regions_at(col, row, resolve)
+    }
+
+    pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
+        self.ghostty.link_target_at(col, row)
     }
 
     pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {
@@ -1428,7 +1447,8 @@ impl GhosttyPaneTerminal {
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false);
-        if CURSOR_POSITION_SETTLE_ENABLED {
+        // Intermediate synchronized-frame positions must not become settled cursors.
+        if CURSOR_POSITION_SETTLE_ENABLED && !synchronized_output {
             let cursor_started = crate::render_prof::timer();
             let cursor_after_write = current_cursor_state(&mut core);
             crate::render_prof::duration_since("pty.cursor_state_update", cursor_started);
@@ -1446,7 +1466,7 @@ impl GhosttyPaneTerminal {
         let render_delay = render_delay_after_pty_write(
             synchronized_output,
             has_kitty_graphics_sequence,
-            cursor_position_settle_pending(&core),
+            core.cursor_settle_state.render_delay(),
             CURSOR_POSITION_SETTLE_ENABLED,
         );
         if request_render {
@@ -1760,6 +1780,21 @@ impl GhosttyPaneTerminal {
         }
     }
 
+    pub fn clear_screen(&self) -> Result<(), String> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| "terminal lock poisoned".to_owned())?;
+        if core.terminal.clear_screen() {
+            #[cfg(windows)]
+            {
+                core.recent_fallback = windows_recent_fallback::Cache::default();
+                windows_recent_fallback::update(&mut core);
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
         if let Ok(mut core) = self.core.lock() {
             #[cfg(windows)]
@@ -1974,6 +2009,10 @@ impl GhosttyPaneTerminal {
                 .kitty_keyboard_flags()
                 .is_ok_and(|flags| flags == 0)
                 && !core.kitty_keyboard.modify_other_keys_enabled()
+                && core
+                    .terminal
+                    .modify_other_keys_enabled()
+                    .is_ok_and(|enabled| !enabled)
         }) {
             if let Some(bytes) = crate::platform::encode_windows_conpty_fallback(&key) {
                 return bytes;
@@ -1998,6 +2037,24 @@ impl GhosttyPaneTerminal {
         key: crate::input::TerminalKey,
         protocol: crate::input::KeyboardProtocol,
     ) -> Vec<u8> {
+        // Ghostty emits extended Enter sequences even without negotiation.
+        // Ordinary shells need legacy input unless the child enabled an extension.
+        if key.code == crossterm::event::KeyCode::Enter
+            && !key.modifiers.is_empty()
+            && self.core.lock().is_ok_and(|core| {
+                core.terminal
+                    .kitty_keyboard_flags()
+                    .is_ok_and(|flags| flags == 0)
+                    && core.kitty_keyboard.modify_other_keys_level() == 0
+                    && core
+                        .terminal
+                        .modify_other_keys_enabled()
+                        .is_ok_and(|enabled| !enabled)
+            })
+        {
+            return crate::input::encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy);
+        }
+
         if matches!(protocol, crate::input::KeyboardProtocol::Legacy)
             && key.code == crossterm::event::KeyCode::Tab
             && key.modifiers == crossterm::event::KeyModifiers::CONTROL
@@ -2206,6 +2263,33 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    pub(crate) fn link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| {
+                core.terminal
+                    .viewport_link_regions(col, u32::from(row), resolve)
+                    .ok()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
+        self.core
+            .lock()
+            .ok()?
+            .terminal
+            .viewport_link_target(col, u32::from(row))
+            .ok()
+            .flatten()
+    }
+
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.core
             .lock()
@@ -2395,10 +2479,6 @@ fn encoded_key_preserves_event_kind(
         })
 }
 
-fn cursor_position_settle_pending(core: &GhosttyPaneCore) -> bool {
-    core.cursor_settle_state.pending()
-}
-
 fn effective_cursor_state(
     core: &mut GhosttyPaneCore,
     current: Option<TerminalCursorState>,
@@ -2413,17 +2493,16 @@ fn effective_cursor_state(
 fn render_delay_after_pty_write(
     synchronized_output: bool,
     has_kitty_graphics_sequence: bool,
-    cursor_position_settle_pending: bool,
+    cursor_position_settle_delay: Option<Duration>,
     cursor_position_settle_enabled: bool,
 ) -> Option<Duration> {
     if synchronized_output {
         None
-    } else if has_kitty_graphics_sequence {
-        Some(KITTY_GRAPHICS_REDRAW_SETTLE)
-    } else if cursor_position_settle_enabled && cursor_position_settle_pending {
-        Some(CURSOR_POSITION_SETTLE)
     } else {
-        None
+        let cursor_delay = cursor_position_settle_enabled
+            .then_some(cursor_position_settle_delay)
+            .flatten();
+        cursor_delay.max(has_kitty_graphics_sequence.then_some(KITTY_GRAPHICS_REDRAW_SETTLE))
     }
 }
 
@@ -4293,11 +4372,108 @@ mod tests {
 
         let result = pane.process_pty_bytes(pane_id, 0, b"\x1b[6;21H", &tx);
 
-        assert_eq!(result.render_delay, Some(CURSOR_POSITION_SETTLE));
+        assert_eq!(result.render_delay, Some(Duration::from_millis(100)));
         assert_eq!(
             pane.cursor_state()
                 .map(|cursor| (cursor.x, cursor.y, cursor.visible)),
             Some((1, 0, true))
+        );
+        // If output stops here, the scheduled repaint must be late enough to
+        // publish this cursor without relying on an unrelated later redraw.
+        let mut core = pane.core.lock().unwrap();
+        let current = current_cursor_state(&mut core);
+        assert_eq!(
+            core.cursor_settle_state
+                .reported_cursor(current, Instant::now() + result.render_delay.unwrap()),
+            current
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cursor_settle_ignores_intermediate_synchronized_frame_positions() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[15;4H", &tx);
+
+        let previous = TerminalCursorState {
+            x: 3,
+            y: 14,
+            visible: true,
+            shape: 0,
+        };
+        {
+            let mut core = pane.core.lock().unwrap();
+            let now = Instant::now();
+            core.cursor_settle_state = CursorPositionSettleState::default();
+            core.cursor_settle_state.observe(
+                Some(TerminalCursorState { x: 2, ..previous }),
+                now - Duration::from_millis(300),
+            );
+            // Seed a pending hold whose deadline has passed, without wall-clock sleeps.
+            core.cursor_settle_state
+                .observe(Some(previous), now - Duration::from_millis(200));
+        }
+
+        for bytes in [
+            b"\x1b[?2026h\x1b[15;4Hx\x1b[13;1H".as_slice(),
+            b"\x1b[0 q\x1b[13;1H \x1b[15;5H",
+            b"\x1b[?25h",
+        ] {
+            let result = pane.process_pty_bytes(pane_id, 0, bytes, &tx);
+            assert!(!result.request_render);
+            assert_eq!(result.render_delay, None);
+            assert_eq!(pane.cursor_state(), Some(previous));
+            assert!(pane.core.lock().unwrap().cursor_settle_state.pending());
+        }
+
+        let result = pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026l", &tx);
+        assert!(result.request_render);
+        assert_eq!(result.render_delay, Some(CURSOR_POSITION_SETTLE));
+        assert!(pane.core.lock().unwrap().cursor_settle_state.pending());
+        assert_eq!(pane.cursor_state(), Some(previous));
+
+        // ConPTY may restore the real caret after the synchronized frame closes.
+        let mut core = pane.core.lock().unwrap();
+        let current = current_cursor_state(&mut core);
+        assert_eq!(
+            core.cursor_settle_state
+                .reported_cursor(current, Instant::now() + CURSOR_POSITION_SETTLE),
+            Some(TerminalCursorState { x: 4, ..previous })
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cursor_settle_preserves_final_visibility_and_shape_across_split_sync_sequences() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[15;4H", &tx);
+
+        for bytes in [
+            b"\x1b[?202".as_slice(),
+            b"6h\x1b[13;1H",
+            b"\x1b[6 q\x1b[15;5H\x1b[?25l\x1b[?20",
+        ] {
+            pane.process_pty_bytes(pane_id, 0, bytes, &tx);
+            assert!(!pane.core.lock().unwrap().cursor_settle_state.pending());
+        }
+
+        let result = pane.process_pty_bytes(pane_id, 0, b"26l", &tx);
+        assert!(result.request_render);
+        assert_eq!(result.render_delay, None);
+        assert_eq!(
+            pane.cursor_state(),
+            Some(TerminalCursorState {
+                x: 4,
+                y: 14,
+                visible: false,
+                shape: 6,
+            })
         );
     }
 
@@ -4322,19 +4498,25 @@ mod tests {
 
     #[test]
     fn cursor_settle_policy_controls_render_delay() {
+        let delay = Some(CURSOR_POSITION_SETTLE);
         assert_eq!(
-            render_delay_after_pty_write(false, false, true, true),
-            Some(CURSOR_POSITION_SETTLE)
+            render_delay_after_pty_write(false, false, delay, true),
+            delay
         );
         assert_eq!(
-            render_delay_after_pty_write(false, false, true, false),
+            render_delay_after_pty_write(false, false, delay, false),
             None
         );
         assert_eq!(
-            render_delay_after_pty_write(false, true, true, false),
+            render_delay_after_pty_write(false, true, delay, false),
             Some(KITTY_GRAPHICS_REDRAW_SETTLE)
         );
-        assert_eq!(render_delay_after_pty_write(true, false, true, true), None);
+        assert_eq!(render_delay_after_pty_write(true, false, delay, true), None);
+        let jump_delay = Some(Duration::from_millis(100));
+        assert_eq!(
+            render_delay_after_pty_write(false, true, jump_delay, true),
+            jump_delay
+        );
     }
 
     #[test]
@@ -4529,6 +4711,126 @@ mod tests {
         assert_eq!(
             kitty.encode_terminal_key(key, crate::input::KeyboardProtocol::Kitty { flags: 3 }),
             b"\x1b[9;5u"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghostty_legacy_modified_enter_is_shell_compatible() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let protocol = crate::input::KeyboardProtocol::Legacy;
+
+        for modifiers in [
+            KeyModifiers::empty(),
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ] {
+            let key = crate::input::TerminalKey::new(KeyCode::Enter, modifiers);
+            let expected = if modifiers.contains(KeyModifiers::ALT) {
+                b"\x1b\r".as_slice()
+            } else {
+                b"\r".as_slice()
+            };
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                assert_eq!(
+                    pane.encode_terminal_key(key.clone().with_kind(kind), protocol),
+                    expected,
+                    "{modifiers:?} {kind:?}"
+                );
+            }
+            assert_eq!(
+                pane.encode_terminal_key(key.clone().with_repeat_count(3), protocol),
+                expected.repeat(3),
+                "{modifiers:?} grouped repeat"
+            );
+            assert!(
+                pane.encode_terminal_key(key.with_kind(KeyEventKind::Release), protocol)
+                    .is_empty(),
+                "{modifiers:?} release"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghostty_modified_enter_tracks_live_protocol_negotiation() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let legacy = ["\r", "\r", "\r", "\x1b\r"];
+        let mode_one = ["\x1b[27;2;13~", "\x1b[27;5;13~", "\x1b[27;9;13~", "\x1b\r"];
+        let mode_two = [
+            "\x1b[27;2;13~",
+            "\x1b[27;5;13~",
+            "\x1b[27;9;13~",
+            "\x1b[27;3;13~",
+        ];
+        let kitty = ["\x1b[13;2u", "\x1b[13;5u", "\x1b[13;9u", "\x1b[13;3u"];
+
+        for (sequence, expected) in [
+            ("", legacy),
+            ("\x1b[>4;1m", mode_one),
+            ("\x1b[>4;2m", mode_two),
+            ("\x1b[>4n", legacy),
+            ("\x1b[>4;2m", mode_two),
+            ("\x1b[>4;0m", legacy),
+            ("\x1b[>5u", kitty),
+            ("\x1b[<u", legacy),
+            ("\x1b[>4;2m\x1b[>1u", kitty),
+            ("\x1b[<u", mode_two),
+            ("\x1b[>4;0m", legacy),
+            ("\x1b[>4;1m", mode_one),
+            ("\x1b[>04n", legacy),
+            ("\x1b[>4;2m", mode_two),
+            ("\x1b[>4", mode_two),
+            ("n", legacy),
+        ] {
+            pane.process_pty_bytes(pane_id, 0, sequence.as_bytes(), &tx);
+            for (modifiers, expected) in [
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::SUPER,
+                KeyModifiers::ALT,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                let key = crate::input::TerminalKey::new(KeyCode::Enter, modifiers);
+                assert_eq!(
+                    pane.encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy),
+                    expected.as_bytes(),
+                    "{modifiers:?} after {sequence:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ghostty_modified_enter_respects_existing_terminal_mode() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.write(b"\x1b[>4;2m");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let key = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(
+            pane.encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy),
+            b"\x1b[27;2;13~"
         );
     }
 
@@ -4879,6 +5181,33 @@ mod tests {
             pane.encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy),
             b"\x1b[13;28;13;1;16;1_"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ghostty_default_pane_sends_legacy_modified_enter() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        for (modifiers, expected) in [
+            // Shift+Enter keeps using the native ConPTY fallback so the child
+            // receives a real key record rather than a CSI 27 sequence.
+            (
+                crossterm::event::KeyModifiers::SHIFT,
+                b"\x1b[13;28;13;1;16;1_".as_slice(),
+            ),
+            (crossterm::event::KeyModifiers::CONTROL, b"\r".as_slice()),
+            (crossterm::event::KeyModifiers::SUPER, b"\r".as_slice()),
+            (crossterm::event::KeyModifiers::ALT, b"\x1b\r".as_slice()),
+        ] {
+            let key = crate::input::TerminalKey::new(crossterm::event::KeyCode::Enter, modifiers);
+            assert_eq!(
+                pane.encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy),
+                expected,
+                "{modifiers:?}"
+            );
+        }
     }
 
     #[test]
